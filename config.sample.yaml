@@ -1,0 +1,9 @@
+command: "codex exec hello"
+match_text: "ERROR: We're currently experiencing high demand, which may cause temporary errors."
+notify_url: ""
+title: "Command matched"
+body: "A可用"
+interval_seconds: 300
+sleep_seconds: 1800
+jitter_seconds: 20
+notify_timeout_seconds: 10
