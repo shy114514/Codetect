@@ -65,7 +65,7 @@ def next_delay(config):
     return max(1.0, interval + random.uniform(-jitter, jitter))
 
 
-def execute_once(config, last_notified_match, debug=False):
+def execute_once(config, matched, debug=False) -> bool:
     result = run_command(config["command"])
     output = result.stdout + result.stderr
     match_text = config["match_text"]
@@ -75,16 +75,16 @@ def execute_once(config, last_notified_match, debug=False):
 
     if match_text in output:
         print("Fail.")
-        return last_notified_match
+        return True
     
-    if match_text == last_notified_match:
-        print("Match is unchanged; notification skipped.")
-        return last_notified_match
+    if not matched:
+        print("State not changed. No notification sent.")
+        return False
 
     send_notification(config, match_text)
     print("Notification sent.")
     time.sleep(config["sleep_seconds"])
-    return match_text
+    return False
 
 
 def main():
@@ -109,12 +109,12 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)
-    last_notified_match = None
+    matched = True
 
     while True:
         started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{started_at}] Running command...")
-        last_notified_match = execute_once(config, last_notified_match, args.debug)
+        matched = execute_once(config, matched, args.debug)
 
         if args.once:
             break
