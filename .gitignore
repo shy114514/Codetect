@@ -47,6 +47,11 @@ Thumbs.db
 # Secrets / config
 config.yaml
 .env
+auth.u.json
+auth.a.json
+init.json
+config.u.toml
+config.a.toml
 
 # Logs
 *.log

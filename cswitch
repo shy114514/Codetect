@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import sys
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+from stat import S_IMODE
+
+
+A_CONFIG_VALUES = {
+    "model_provider": "anyrouter",
+    "preferred_auth_method": "apikey",
+    "model_reasoning_effort": "high",
+    "service_tier": "fast",
+    "plan_mode_reasoning_effort": "high",
+}
+TOP_LEVEL_ASSIGNMENT = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<key>[A-Za-z0-9_-]+)[ \t]*="
+)
+TABLE_HEADER = re.compile(r"^[ \t]*\[")
+
+
+class CSwitchError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class SwitchPaths:
+    storage_dir: Path
+    codex_dir: Path
+
+    @property
+    def active_auth(self):
+        return self.codex_dir / "auth.json"
+
+    @property
+    def active_config(self):
+        return self.codex_dir / "config.toml"
+
+    @property
+    def initial_a_auth(self):
+        return self.storage_dir / "init.json"
+
+    def auth_snapshot(self, state):
+        return self.storage_dir / f"auth.{state}.json"
+
+    def config_snapshot(self, state):
+        return self.storage_dir / f"config.{state}.toml"
+
+
+def _line_ending(line):
+    if line.endswith("\r\n"):
+        return "\r\n"
+    if line.endswith("\n"):
+        return "\n"
+    return ""
+
+
+def _inline_comment(line):
+    body = line.removesuffix(_line_ending(line))
+    quote = None
+    escaped = False
+
+    for index, char in enumerate(body):
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif quote == "'":
+            if char == quote:
+                quote = None
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == "#":
+            start = index
+            while start > 0 and body[start - 1] in " \t":
+                start -= 1
+            return body[start:]
+
+    return ""
+
+
+def make_a_config(source):
+    try:
+        tomllib.loads(source)
+    except tomllib.TOMLDecodeError as error:
+        raise CSwitchError(f"Invalid config.toml: {error}") from error
+
+    lines = source.splitlines(keepends=True)
+    table_index = next(
+        (index for index, line in enumerate(lines) if TABLE_HEADER.match(line)),
+        len(lines),
+    )
+    top_level = []
+    updated_keys = set()
+
+    for line in lines[:table_index]:
+        assignment = TOP_LEVEL_ASSIGNMENT.match(line)
+        if not assignment:
+            top_level.append(line)
+            continue
+
+        key = assignment.group("key")
+        if key == "model":
+            continue
+        if key not in A_CONFIG_VALUES:
+            top_level.append(line)
+            continue
+
+        top_level.append(
+            f'{assignment.group("indent")}{key} = "{A_CONFIG_VALUES[key]}"'
+            f"{_inline_comment(line)}{_line_ending(line)}"
+        )
+        updated_keys.add(key)
+
+    missing_keys = [key for key in A_CONFIG_VALUES if key not in updated_keys]
+    if missing_keys:
+        newline = "\r\n" if "\r\n" in source else "\n"
+        insert_at = len(top_level)
+        while insert_at > 0 and not top_level[insert_at - 1].strip():
+            insert_at -= 1
+        if insert_at > 0 and not _line_ending(top_level[insert_at - 1]):
+            top_level[insert_at - 1] += newline
+        additions = [
+            f'{key} = "{A_CONFIG_VALUES[key]}"{newline}' for key in missing_keys
+        ]
+        top_level[insert_at:insert_at] = additions
+
+    result = "".join(top_level + lines[table_index:])
+    try:
+        tomllib.loads(result)
+    except tomllib.TOMLDecodeError as error:
+        raise CSwitchError(f"Generated A config is invalid: {error}") from error
+    return result
+
+
+def _require_files(paths):
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise CSwitchError(f"Missing required file: {', '.join(missing)}")
+
+
+def _load_json(content, path):
+    try:
+        return json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CSwitchError(f"Invalid JSON in {path}: {error}") from error
+
+
+def _write_in_place(path, content, mode):
+    with path.open("wb") as output:
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+    path.chmod(mode)
+
+
+def _current_state(paths):
+    config_content = paths.active_config.read_bytes()
+    auth_content = paths.active_auth.read_bytes()
+
+    try:
+        config = tomllib.loads(config_content.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise CSwitchError(f"Invalid TOML in {paths.active_config}: {error}") from error
+    auth = _load_json(auth_content, paths.active_auth)
+
+    model_provider = config.get("model_provider")
+    if model_provider == "anyrouter":
+        config_state = "a"
+    elif model_provider in {None, "openai"}:
+        config_state = "u"
+    else:
+        raise CSwitchError(
+            f"Cannot determine state from model_provider={model_provider!r}"
+        )
+
+    auth_mode = auth.get("auth_mode")
+    if auth_mode == "chatgpt":
+        auth_state = "u"
+    elif auth_mode == "apikey" or (
+        auth_mode is None and "OPENAI_API_KEY" in auth
+    ):
+        auth_state = "a"
+    else:
+        raise CSwitchError(f"Cannot determine state from auth_mode={auth_mode!r}")
+
+    if config_state != auth_state:
+        raise CSwitchError(
+            "State mismatch: "
+            f"config.toml indicates {config_state.upper()}, "
+            f"but auth.json indicates {auth_state.upper()}"
+        )
+    return config_state
+
+
+def initialize(paths):
+    _require_files([paths.active_auth, paths.active_config, paths.initial_a_auth])
+    current = _current_state(paths)
+    if current != "u":
+        raise CSwitchError("Cannot initialize: active files already indicate A")
+
+    u_auth = paths.active_auth.read_bytes()
+    u_config = paths.active_config.read_bytes()
+    a_auth = paths.initial_a_auth.read_bytes()
+    _load_json(a_auth, paths.initial_a_auth)
+
+    try:
+        source_config = u_config.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise CSwitchError(f"Invalid UTF-8 in {paths.active_config}: {error}") from error
+    a_config = make_a_config(source_config)
+    a_config_bytes = a_config.encode("utf-8")
+    auth_mode = S_IMODE(paths.active_auth.stat().st_mode)
+    config_mode = S_IMODE(paths.active_config.stat().st_mode)
+
+    _write_in_place(paths.auth_snapshot("u"), u_auth, auth_mode)
+    _write_in_place(paths.config_snapshot("u"), u_config, config_mode)
+    _write_in_place(paths.auth_snapshot("a"), a_auth, 0o600)
+    _write_in_place(paths.config_snapshot("a"), a_config_bytes, config_mode)
+    _write_in_place(paths.active_auth, a_auth, auth_mode)
+    _write_in_place(paths.active_config, a_config_bytes, config_mode)
+    return "Initialized U snapshots and activated A."
+
+
+def switch(paths):
+    _require_files([paths.active_auth, paths.active_config])
+    current = _current_state(paths)
+    target = "a" if current == "u" else "u"
+    target_auth = paths.auth_snapshot(target)
+    target_config = paths.config_snapshot(target)
+    _require_files(
+        [paths.active_auth, paths.active_config, target_auth, target_config]
+    )
+    current_auth = paths.active_auth.read_bytes()
+    current_config = paths.active_config.read_bytes()
+    target_auth_content = target_auth.read_bytes()
+    target_config_content = target_config.read_bytes()
+    _load_json(target_auth_content, target_auth)
+    try:
+        tomllib.loads(current_config.decode("utf-8"))
+        tomllib.loads(target_config_content.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise CSwitchError(f"Invalid TOML during switch: {error}") from error
+
+    auth_mode = S_IMODE(paths.active_auth.stat().st_mode)
+    config_mode = S_IMODE(paths.active_config.stat().st_mode)
+    _write_in_place(paths.auth_snapshot(current), current_auth, auth_mode)
+    _write_in_place(paths.config_snapshot(current), current_config, config_mode)
+    _write_in_place(paths.active_auth, target_auth_content, auth_mode)
+    _write_in_place(paths.active_config, target_config_content, config_mode)
+    return f"Switched {current.upper()} -> {target.upper()}."
+
+
+def run(paths):
+    if not paths.auth_snapshot("u").exists():
+        return initialize(paths)
+    return switch(paths)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Switch ~/.codex authentication and configuration between U and A."
+    )
+    parser.parse_args()
+
+    storage_dir = Path(__file__).resolve().parent
+    paths = SwitchPaths(storage_dir=storage_dir, codex_dir=Path.home() / ".codex")
+    try:
+        print(run(paths))
+    except (CSwitchError, OSError) as error:
+        print(f"cswitch: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
