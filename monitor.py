@@ -73,12 +73,12 @@ def execute_once(config, matched, debug=False) -> bool:
     if debug:
         print(f"stdout: \n{result.stdout}" + "stderr: \n" + result.stderr)
 
-    if match_text in output:
+    if match_text not in output:
         print("Fail.")
         return True
     
-    if not matched:
-        print("State not changed. No notification sent.")
+    if matched:
+        print("Still Matched. No notification sent.")
         time.sleep(config["sleep_seconds"])
         return False
 
@@ -110,7 +110,7 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)
-    matched = True
+    matched = False
 
     while True:
         started_at = time.strftime("%Y-%m-%d %H:%M:%S")
