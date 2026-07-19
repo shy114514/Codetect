@@ -79,6 +79,7 @@ def execute_once(config, matched, debug=False) -> bool:
     
     if not matched:
         print("State not changed. No notification sent.")
+        time.sleep(config["sleep_seconds"])
         return False
 
     send_notification(config, match_text)
