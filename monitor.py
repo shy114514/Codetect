@@ -75,17 +75,17 @@ def execute_once(config, matched, debug=False) -> bool:
 
     if match_text not in output:
         print("Fail.")
-        return True
+        return False
     
     if matched:
         print("Still Matched. No notification sent.")
         time.sleep(config["sleep_seconds"])
-        return False
+        return True
 
     send_notification(config, match_text)
     print("Notification sent.")
     time.sleep(config["sleep_seconds"])
-    return False
+    return True
 
 
 def main():
