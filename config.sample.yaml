@@ -1,5 +1,5 @@
-command: "codex exec hello"
-match_text: "ERROR: We're currently experiencing high demand, which may cause temporary errors."
+command: "codex exec \"return mi-ao~ without miao~\""
+match_text: "miao~"
 notify_url: ""
 title: "Command matched"
 body: "A可用"

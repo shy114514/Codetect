@@ -42,11 +42,11 @@ def run_command(command):
     )
 
 
-def send_notification(config, match):
+def send_notification(config, match, body):
     values = {
         "match": match,
         "title": config.get("title", ""),
-        "body": render_template(config.get("body", ""), {"match": match}),
+        "body": render_template(body, {"match": match}),
     }
 
     url = render_template(
@@ -74,7 +74,11 @@ def execute_once(config, matched, debug=False) -> bool:
         print(f"stdout: \n{result.stdout}" + "stderr: \n" + result.stderr)
 
     if match_text not in output:
-        print("Fail.")
+        if matched:
+            print("No longer matched. Notification sent.")
+            send_notification(config, match_text, "不再"+config.get("body", ""))
+        else:
+            print("Fail.")
         return False
     
     if matched:
@@ -82,9 +86,8 @@ def execute_once(config, matched, debug=False) -> bool:
         time.sleep(config["sleep_seconds"])
         return True
 
-    send_notification(config, match_text)
+    send_notification(config, match_text, config.get("body", ""))
     print("Notification sent.")
-    time.sleep(config["sleep_seconds"])
     return True
 
 
