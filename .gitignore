@@ -52,6 +52,7 @@ auth.a.json
 init.json
 config.u.toml
 config.a.toml
+accounts/
 
 # Logs
 *.log
