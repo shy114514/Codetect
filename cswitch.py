@@ -8,13 +8,52 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import tty
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
+from termios import TCSADRAIN, tcgetattr, tcsetattr
 
 
 class AccountError(Exception):
     """Raised when an account operation cannot be completed safely."""
+
+
+class AccountChoice(Enum):
+    """Non-account choices shown while selecting an account."""
+
+    CREATE_NEW = auto()
+    SKIP = auto()
+    MAIN_MENU = auto()
+
+
+@contextmanager
+def _cbreak_stdin():
+    """Read terminal input one key at a time, restoring its original settings."""
+    file_descriptor = sys.stdin.fileno()
+    settings = tcgetattr(file_descriptor)
+    try:
+        tty.setcbreak(file_descriptor)
+        yield
+    finally:
+        tcsetattr(file_descriptor, TCSADRAIN, settings)
+
+
+def _read_single_choice(prompt: str) -> str:
+    """Return one keystroke immediately when running in an interactive terminal."""
+    if not sys.stdin.isatty():
+        return input(prompt).strip().casefold()
+
+    print(prompt, end="", flush=True)
+    with _cbreak_stdin():
+        choice = sys.stdin.read(1)
+    if choice in {"\r", "\n"}:
+        print()
+        return ""
+    print(choice)
+    return choice.casefold()
 
 
 @dataclass(frozen=True)
@@ -236,29 +275,115 @@ class Menu:
     def __init__(self, manager: AccountManager):
         self.manager = manager
 
-    def _choose_account(self, prompt: str, allow_new: bool = False) -> dict | None:
+    def _choose_account(
+        self,
+        prompt: str,
+        *,
+        allow_new: bool = False,
+        skip_label: str | None = None,
+        allow_main_menu: bool = False,
+    ) -> dict | AccountChoice:
         accounts = self.manager.accounts()
-        if accounts:
-            print(prompt)
-            for index, account in enumerate(accounts, start=1):
-                print(f"  {index}. {account['name']} [{account['auth_type']}]")
+        print(prompt)
+        for index, account in enumerate(accounts, start=1):
+            print(f"  {index}. {account['name']} [{account['auth_type']}]")
         if allow_new:
             print("  N. Create a new account")
-        choice = input("> ").strip().lower()
-        if allow_new and choice == "n":
-            return None
+        if skip_label:
+            print(f"  S. {skip_label}")
+        if allow_main_menu:
+            print("  M. Return to main menu")
+
+        shortcuts = {}
+        if allow_new:
+            shortcuts["n"] = AccountChoice.CREATE_NEW
+        if skip_label:
+            shortcuts["s"] = AccountChoice.SKIP
+        if allow_main_menu:
+            shortcuts["m"] = AccountChoice.MAIN_MENU
+
+        if not sys.stdin.isatty():
+            return self._resolve_account_choice(input("> ").strip().casefold(), accounts, shortcuts)
+
+        print("> ", end="", flush=True)
+        choice = ""
+        with _cbreak_stdin():
+            while True:
+                key = sys.stdin.read(1)
+                if key in {"\r", "\n"}:
+                    print()
+                    return self._resolve_account_choice(choice, accounts, shortcuts)
+                if key in {"\b", "\x7f"}:
+                    if choice:
+                        choice = choice[:-1]
+                        print("\b \b", end="", flush=True)
+                    continue
+                if not key.isprintable():
+                    continue
+
+                choice += key.casefold()
+                print(key, end="", flush=True)
+                if len(choice) == 1 and choice in shortcuts:
+                    print()
+                    return shortcuts[choice]
+
+                matches = [
+                    account
+                    for account in accounts
+                    if account["name"].casefold().startswith(choice)
+                ]
+                if len(matches) == 1:
+                    print()
+                    return matches[0]
+
+                if len(choice) == 1 and choice.isdigit():
+                    try:
+                        selected = accounts[int(choice) - 1]
+                    except IndexError:
+                        continue
+                    print()
+                    return selected
+
+    @staticmethod
+    def _resolve_account_choice(
+        choice: str, accounts: list[dict], shortcuts: dict[str, AccountChoice]
+    ) -> dict | AccountChoice:
+        if choice in shortcuts:
+            return shortcuts[choice]
         try:
             return accounts[int(choice) - 1]
         except (ValueError, IndexError):
-            raise AccountError("Please choose a listed account.")
+            matches = [
+                account
+                for account in accounts
+                if choice and account["name"].casefold().startswith(choice)
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            raise AccountError("Please choose a listed account or enter a unique name prefix.")
 
-    def _save_current(self) -> dict:
-        account = self._choose_account("Save current credentials to:", allow_new=True)
+    def _save_current(
+        self, *, allow_skip_save: bool = False, allow_main_menu: bool = False
+    ) -> bool:
+        account = self._choose_account(
+            "Save current credentials to:",
+            allow_new=True,
+            skip_label="Skip saving current credentials" if allow_skip_save else None,
+            allow_main_menu=allow_main_menu,
+        )
+        if account is AccountChoice.SKIP:
+            print("Current credentials were not saved.")
+            return True
+        if account is AccountChoice.MAIN_MENU:
+            return False
+
         detected_type = self.manager.detect_auth_type()
-        if account is None:
+        if account is AccountChoice.CREATE_NEW:
             name = input("New account name: ")
-            answer = input(f"Authentication type [1=chatgpt, 2=api_key] (default {detected_type}): ").strip()
-            auth_type = {"1": "chatgpt", "2": "api_key", "" : detected_type}.get(answer)
+            answer = _read_single_choice(
+                f"Authentication type [1=chatgpt, 2=api_key] (default {detected_type}): "
+            )
+            auth_type = {"1": "chatgpt", "2": "api_key", "": detected_type}.get(answer)
             if auth_type is None:
                 raise AccountError("Please choose 1 or 2.")
             saved = self.manager.save_current(name, auth_type)
@@ -272,7 +397,7 @@ class Menu:
                 account["name"], detected_type, account["id"]
             )
         print(f"Saved current credentials as {saved['name']!r}.")
-        return saved
+        return True
 
     def show_status(self) -> None:
         current = self.manager.current_account()
@@ -286,10 +411,18 @@ class Menu:
 
     def switch(self) -> None:
         print("First save the current Codex credentials.")
-        self._save_current()
-        target = self._choose_account("Switch to:")
-        if target is None:
-            raise AccountError("No target account selected.")
+        if not self._save_current(allow_skip_save=True, allow_main_menu=True):
+            return
+        target = self._choose_account(
+            "Switch to:",
+            skip_label="Skip switching",
+            allow_main_menu=True,
+        )
+        if target is AccountChoice.SKIP:
+            print("Switch skipped.")
+            return
+        if target is AccountChoice.MAIN_MENU:
+            return
         processes = codex_processes()
         if processes:
             print("Running Codex processes detected:")
@@ -314,29 +447,37 @@ class Menu:
         print(f"Deleted {account['name']!r}.")
 
     def run(self) -> None:
+        self._run_operation(self.switch)
         while True:
             print("\nCodex account manager")
-            print("1. List accounts and status")
-            print("2. Save current credentials")
-            print("3. Save current credentials and switch")
-            print("4. Delete an account")
-            print("5. Exit")
-            choice = input("> ").strip()
-            try:
-                if choice == "1":
-                    self.show_status()
-                elif choice == "2":
-                    self._save_current()
-                elif choice == "3":
-                    self.switch()
-                elif choice == "4":
-                    self.delete()
-                elif choice == "5":
-                    return
-                else:
-                    print("Please choose 1 through 5.")
-            except (AccountError, OSError) as error:
-                print(f"Error: {error}", file=sys.stderr)
+            print("1. Save current credentials and switch")
+            print("2. List accounts and status")
+            print("3. Delete an account")
+            print("4. Exit")
+            choice = self._read_menu_choice()
+            if choice == "1":
+                self._run_operation(self.switch)
+            elif choice == "2":
+                self._run_operation(self.show_status)
+            elif choice == "3":
+                self._run_operation(self.delete)
+            elif choice == "4":
+                return
+            elif choice == "q":
+                return
+            else:
+                print("Please choose 1 through 4, or q to exit.")
+
+    @staticmethod
+    def _read_menu_choice() -> str:
+        return _read_single_choice("> ")
+
+    @staticmethod
+    def _run_operation(operation) -> None:
+        try:
+            operation()
+        except (AccountError, OSError) as error:
+            print(f"Error: {error}", file=sys.stderr)
 
 
 def main() -> int:
